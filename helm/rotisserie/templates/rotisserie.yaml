@@ -1,3 +1,17 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ template "rotisserie.fullname" . }}-jc-role
+subjects:
+  - kind: ServiceAccount
+    name: default
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+---
 apiVersion: extensions/v1beta1
 kind: Deployment
 metadata:
@@ -53,6 +67,11 @@ spec:
               secretKeyRef:
                 name: {{ template "rotisserie.fullname" . }}-secrets
                 key: clientID
+          - name: REDIS_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: {{ template "rotisserie.fullname" . }}-redis
+                key: redis-password
           ports:
             - containerPort: 3000
 ---
@@ -74,6 +93,36 @@ spec:
           image: {{ .Values.imageRepository }}/rotisserie-ocr:{{ .Values.imageTag }}
           ports:
             - containerPort: 3001
+---
+apiVersion: extensions/v1beta1
+kind: Deployment
+metadata:
+  name: {{ template "rotisserie.fullname" . }}-jc
+  chart: {{ template "rotisserie.chart" . }}
+  release: {{ .Release.Name }}
+  heritage: {{ .Release.Service }}
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: {{ template "rotisserie.fullname" . }}-jc
+    spec:
+      containers:
+        - name: {{ .Chart.Name }}-jc
+          image: eggshell/job-controller:latest
+          imagePullPolicy: Always
+          env:
+          - name: TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: {{ template "rotisserie.fullname" . }}-secrets
+                key: token
+          - name: REDIS_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: {{ template "rotisserie.fullname" . }}-redis
+                key: redis-password
 ---
 apiVersion: v1
 kind: Service

@@ -35,3 +35,9 @@ secrets:
 certManager:
   email:
   url: https://acme-v01.api.letsencrypt.org/directory
+
+# Redis
+
+# Specify the password for access to redis
+redis:
+  redisPassword:

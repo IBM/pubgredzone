@@ -1,0 +1,3 @@
+streamlink
+ffmpeg-python
+redis

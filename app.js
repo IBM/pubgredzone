@@ -1,17 +1,11 @@
 #!/usr/bin/env node
 
-// built-in requirements
-const fs = require("fs");
-const path = require("path");
-
 // external dependencies
 const express = require("express");
 const request = require("request");
 const Log = require("log");
 const log = new Log("info");
-const FFMpeg = require("fluent-ffmpeg");
-const gm = require("gm").subClass({imageMagick: true});
-const {spawn} = require("child_process");
+const redis = require("redis");
 
 // construct express app
 const app = express();
@@ -24,26 +18,8 @@ let currentStream = {
   "stream_url": "https://example.com",
 };
 let allStreams = [currentStream];
-
-/**
- * Ensures given filesystem directory if it does not exist.
- * @param {string} dirPath - Relative or absolute path to
- * desired directory.
- */
-function ensureDir(dirPath) {
-  const parts = dirPath.split(path.sep);
-  const mkdirSync = function(dirPath) {
-    try {
-      fs.mkdirSync(dirPath);
-    } catch (err) {
-      if (err.code !== "EEXIST") throw err;
-    }
-  };
-
-  for (let i = 1; i <= parts.length; i++) {
-    mkdirSync(path.join.apply(null, parts.slice(0, i)));
-  }
-}
+let client = redis.createClient({host: "redis-master"});
+client.auth(process.env.REDIS_PASSWORD);
 
 /**
  * Gets list of PUBG streams from Twitch API v5.
@@ -55,7 +31,7 @@ function listStreams(callback) {
   let clientID = process.env.clientID;
   let whitelist = process.env.ROTISSERIE_WHITELIST;
   let blacklist = process.env.ROTISSERIE_BLACKLIST;
-  let gameURL = "https://api.twitch.tv/kraken/streams?game=PLAYERUNKNOWN'S+BATTLEGROUNDS&language=en&stream_type=live&limit=20";
+  let gameURL = "https://api.twitch.tv/kraken/streams?game=PLAYERUNKNOWN'S+BATTLEGROUNDS&language=en&stream_type=live&limit=100";
   let options = {
     url: gameURL,
     headers: {
@@ -99,182 +75,15 @@ function listStreams(callback) {
 }
 
 /**
- * Records short clip of each stream gathered in listStreams.
- * @param {object} options - object of other params
- * @param {string} streamName - name of stream to record.
- * @param {string} clipsDir - Relative path to directory containing short
- * recorded clips of each stream in streamsList.
- * @return {promise} - A promise that resolves if a stream is recorded.
+ * Runner for listing streams and adding them to Redis
  */
-function recordStream(options) {
-  return new Promise((resolve, reject) => {
-    log.info("recording clip of stream: " + options.streamName);
-    const child = spawn("livestreamer", ["--yes-run-as-root", "-Q", "-f",
-      "--twitch-oauth-token", process.env.token,
-      "twitch.tv/" + options.streamName, "720p", "-o",
-      options.clipsDir + options.streamName + ".mp4"]);
-    setTimeout(function() {
-      child.kill("SIGINT");
-      log.info("recorded stream: " + options.streamName);
-      resolve(options);
-    }, 4000);
-  });
-}
-
-/**
- * Takes screenshots of all clips recorded in recordStreams.
- * @param {object} options - object of other params
- * @param {string} streamName - name of stream's clip to screenshot.
- * @param {string} clipsDir - Relative path to directory containing short
- * recorded clips of each stream in streamsList.
- * @param {string} thumbnailsDir - Relative path to directory containing
- * screenshots of each clip recorded in recordStreams.
- * @return {promise} - a promise that resolves if a screenshot is taken.
- */
-function takeScreenshot(options) {
-  return new Promise((resolve, reject) => {
-    if (fs.existsSync(options.clipsDir + options.streamName + ".mp4")) {
-      log.info("taking screenshot of stream: " + options.streamName);
-      new FFMpeg(options.clipsDir + options.streamName + ".mp4")
-        .takeScreenshots({
-          timestamps: [0],
-          folder: options.thumbnailsDir,
-          filename: options.streamName + ".png",
-        })
-        .on("end", function() {
-          resolve(options);
-        })
-        .on("error", function(err) {
-          fs.unlinkSync(options.clipsDir + options.streamName + ".mp4");
-          log.info("Deleted " + options.clipsDir
-                        + options.streamName + ".mp4");
-          reject(new Error("An error occurred: " + err.message));
-        });
-    } else {
-      reject(new Error("File " + options.clipsDir
-        + options.streamName + ".mp4 not found."));
-    }
-  });
-}
-
-/**
- * Crops all screenshots taken in takeScreenshot to just the area containing
- * the number of players alive in-game.
- * @param {object} options - object of other params
- * @param {string} streamName - name of stream's screenshot to crop.
- * @param {string} thumbnailsDir - Relative path to directory containing
- * screenshots of each clip recorded in recordStream.
- * @param {string} cropsDir - Relative path to directory containing cropped
- * versions of all screenshots taken in takeScreenshot.
- * @return {promise} - a promise which resolves if a screenshot is cropped.
- */
-function cropScreenshot(options) {
-  return new Promise((resolve, reject) => {
-    log.info("cropping screenshot of stream: " + options.streamName);
-    if (fs.existsSync(options.thumbnailsDir + options.streamName + ".png")) {
-      gm(options.thumbnailsDir + options.streamName + ".png")
-        .crop(22, 22, 1190, 20)
-        .type("Grayscale")
-        .write(options.cropsDir + options.streamName + ".png", function(err) {
-          resolve(options);
-          if (err) reject(err);
-        });
-      log.info("cropped screenshot of: " + options.streamName);
-    } else {
-      reject(new Error(options.streamName + ": input file not found"));
-    }
-  });
-}
-
-
-/**
- * OCR the data (via web request)
- * Uses the rotisserie-ocr microservice
- * @param {object} options - object of other params
- * @return {promise} - a promise that is resolved if the a screenshot is ocr'd
- * successfully.
- */
-function ocrCroppedShot(options) {
-  return new Promise((resolve, reject) => {
-    let formData = {
-      image: fs.createReadStream(__dirname
-                                 + options.cropsDir.replace(".", "")
-                                 + options.streamName + ".png"),
-    };
-
-    // k8s injects the following variables
-    // ROTISSERIE_OCR_SERVICE_HOST=10.10.10.65
-    // ROTISSERIE_OCR_SERVICE_PORT=3001
-
-    let requestOptions = {
-      url: "http://" + process.env.ROTISSERIE_OCR_SERVICE_HOST + ":" + process.env.ROTISSERIE_OCR_SERVICE_PORT + "/process_pubg",
-      formData: formData,
-    };
-
-    request.post(requestOptions, function(err, httpResponse, body) {
-      if (err) {
-        console.error("upload failed");
-        reject(err);
-      } else {
-        let parsed = JSON.parse(body);
-        let object = {};
-        object.name = options.streamName;
-        object.alive = parsed.number;
-        resolve(object);
-      }
-    });
-  });
-}
-
-/**
- * Runner for listing streams and firing up a worker for each of those streams
- * to handle the stream processing.
- * @param {string} cropsDir - path to directory containing cropped thumbnails
- * containing the number of players alive.
- */
-function updateStreamsList(cropsDir) {
+function updateStreamsList() {
   // get list of twitch streams and record each one
   listStreams(function(response) {
     let streamsList = response;
     log.info(streamsList.length);
-    let array = [];
-    let newAllStreams = [];
-    for (let stream in streamsList) {
-      let streamName = streamsList[stream];
-      const data = {
-        streamName: streamName,
-        clipsDir: "./streams/clips/",
-        thumbnailsDir: "./streams/thumbnails/",
-        cropsDir: "./streams/crops/",
-      };
 
-      recordStream(data)
-        .then(takeScreenshot)
-        .then(cropScreenshot)
-        .then(ocrCroppedShot)
-        .then(function(streamobj) {
-          log.info(streamobj.name + " = " + streamobj.alive + " alive.");
-          array.push(streamobj);
-        }).catch((error) => {
-          log.error(error.message);
-        });
-    }
-    setTimeout(function() {
-      array.sort(function(a, b) {
-        return a.alive - b.alive;
-      });
-      if (array.length > 0) {
-        log.info(array);
-        log.info("lowest stream: " + array[0].name);
-        currentStream = streamToObject(array[0]);
-        for (let idx in array) {
-          newAllStreams.push(streamToObject(array[idx]));
-        }
-        allStreams = newAllStreams;
-      } else {
-        log.error("Empty array, not switching");
-      }
-    }, 25000);
+    client.sadd("stream-list", streamsList);
   });
 }
 
@@ -295,23 +104,63 @@ function streamToObject(stream) {
 }
 
 /**
+ * Finds lowest stream from list of streams and their associated playercounts
+ * from redis.
+ */
+function findLowestStream() {
+  // Grab first 50 elements of stream-by-alive. Because it's
+  // a sorted set the elements will be returned by the number
+  // of players alive, ascending.
+  args = ["stream-by-alive", "0", "50", "WITHSCORES"];
+
+  // Start a transaction to retrieve top 50 streams and then delete
+  // the key.
+  client.multi()
+    .zrange(args)
+    .del("stream-by-alive")
+    .exec(function(err, responses) {
+      if (err) throw err;
+
+      // multi passes a list of repsonses for each command in the
+      // transaction. We only care about the first one, the zrange
+      // command.
+      response = responses[0];
+
+      newStreams = [];
+      streams = [];
+
+      // Turn list of stream,score items into a list of objects
+      for (let idx = 0; idx < response.length; idx += 2) {
+        obj = {"name": response[idx], "alive": response[idx+1]};
+        streams.push(obj);
+      }
+
+      for (let stream of streams) {
+        newStreams.push(streamToObject(stream));
+      }
+
+      if (newStreams.length > 0) {
+        newStreams.reverse;
+        allStreams = newStreams;
+      } else {
+        log.error("Empty stream list, not switching.");
+      }
+    });
+}
+
+
+/**
  * Runs logic to get lowest stream and starts express app server.
  */
 function main() {
-  const clipsDir = "./streams/clips/";
-  const thumbnailsDir = "./streams/thumbnails/";
-  const cropsDir = "./streams/crops/";
-
-  ensureDir(clipsDir);
-  ensureDir(thumbnailsDir);
-  ensureDir(cropsDir);
-
-  // init website with lowest stream.
-  updateStreamsList(cropsDir);
-
-  // continue searching for lowest stream every 30 seconds.
+  // Pull list of streams every 20 seconds
   setInterval(function() {
-    updateStreamsList(cropsDir);
+    updateStreamsList();
+  }, 20000);
+
+  // Find the lowest stream every 30 seconds
+  setInterval(function() {
+    findLowestStream();
   }, 30000);
 
   // serve index.html
