@@ -34,7 +34,7 @@
   "devDependencies": {
     "babel-cli": "^6.26.0",
     "babel-preset-env": "^1.6.1",
-    "node-sass": "^4.9.2",
+    "node-sass": "^4.13.1",
     "npm-run-all": "^2.2.2"
   }
 }
